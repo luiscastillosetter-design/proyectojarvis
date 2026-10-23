@@ -1,0 +1,35 @@
+# Credenciales y Secretos de la Agencia (PROHIBIDO SUBIR)
+.env
+.env.local
+.env.production
+credentials.json
+token_google.json
+
+# Bases de Datos Locales de Respaldo
+*.db
+*.sqlite3
+
+# Archivos Temporales y Caché de Python
+__pycache__/
+temp_audios/
+temp_videos/
+temp_media/
+contratos_pdf/
+*.log
+
+# Entorno Virtual Python
+venv/
+
+# Dependencias y Compilación de Next.js / Vercel
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+.DS_Storeproyectos_agencia/
+
+venv-xtts/
+xtts_models/
+
+proyectos_agencia/
