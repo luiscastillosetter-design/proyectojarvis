@@ -290,15 +290,15 @@ export default function JarvisCyberpunkHUD() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        action: "guardar_memoria",
+        action: "guardar_firma",
         payload: {
-          categoria: "firma_digital",
-          tema: "Firma Táctil en HUD",
-          detalle: "Firma de conformidad capturada en el Dashboard Web y lista para PDF.",
+          cliente: "Cliente General",
+          dataUrl: dataUrl,
         },
       }),
     });
-    executeCommand("Confirmar captura de firma digital táctil para contrato PDF", false);
+    await fetchLiveSupabase();
+    executeCommand("Firma digital táctil capturada y sincronizada para contratos PDF", false);
   };
 
   const cuentasEntries = Object.entries(resumen.saldosPorCuenta);
