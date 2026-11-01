@@ -1,21 +1,20 @@
-# Core
+# Core & Red
 requests==2.31.0
 python-dotenv==1.0.1
+psycopg2-binary==2.9.9
 
-# AI & LLM
+# Inteligencia Artificial & LLM
 google-genai==0.1.0
 google-auth==2.25.2
 google-auth-oauthlib==1.2.0
 google-api-python-client==2.121.0
 duckduckgo_search==6.2.1
-chromadb==0.4.24
 
-# Communication & Social Media
+# Mensajería & Redes
 pyTelegramBotAPI==4.15.0
+instaloader==4.10.3
 
-# Web & Data
-flask==3.0.2
-streamlit==1.37.0
-
-# Utilities
+# Web Scraping & Documentos
+scrapling==0.2.1
+fpdf2==2.7.9
 pillow==10.2.0

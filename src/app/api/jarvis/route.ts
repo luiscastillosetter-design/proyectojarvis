@@ -410,7 +410,7 @@ export async function POST(req: Request) {
         });
       }
 
-      const systemPrompt = `Eres JARVIS, Asistente Ejecutivo, Jefe de Gabinete y CFO de Luis Castillo en Telotengo Solutions.
+      const systemPrompt = `Eres JARVIS, Asistente Ejecutivo, Jefe de Gabinete y CFO de Luis Castillo en GuiporDI Soluciones.
 Tu misión es ejecutar y registrar las órdenes del jefe en la base de datos de Supabase usando tus herramientas.
 Si el usuario te dice que anotó un cobro, que gastó, que recuerdes algo, que crees una tarea o un proyecto, USA TUS HERRAMIENTAS DIRECTAMENTE.
 Tono: Formal, ejecutivo, breve, en español y sin tablas markdown.

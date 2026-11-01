@@ -1,15 +1,19 @@
 import os
 import sys
+import re
 import json
+import base64
 import sqlite3
 import logging
 import requests
 import time
 import threading
-import asyncio
 import telebot
 import platform
 import datetime
+from zoneinfo import ZoneInfo
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from duckduckgo_search import DDGS
 
@@ -17,7 +21,6 @@ from duckduckgo_search import DDGS
 from google import genai
 from google.oauth2.credentials import Credentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
@@ -38,12 +41,34 @@ logger = logging.getLogger("JarvisExecutive")
 # =====================================================================
 load_dotenv()
 
+TZ_NAME = os.getenv("TZ_JARVIS", "America/Caracas")
+try:
+    ZONA_HORARIA = ZoneInfo(TZ_NAME)
+except Exception:
+    ZONA_HORARIA = datetime.timezone(datetime.timedelta(hours=-4))
+
+def ahora_local() -> datetime.datetime:
+    return datetime.datetime.now(ZONA_HORARIA)
+
+def hoy_local_str() -> str:
+    return ahora_local().strftime("%Y-%m-%d")
+
 MWAPI_KEY = os.getenv("MWAPI_KEY") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
 MWAPI_BASE_URL = os.getenv("MWAPI_BASE_URL", "https://api.mwapi.dev").rstrip("/")
 MWAPI_MODEL = os.getenv("MWAPI_MODEL", "claude-haiku-4-5-20251001")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL = (
+    os.getenv("SUPABASE_URL")
+    or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+    or "https://fmskxeqxbcklcjasefnv.supabase.co"
+).rstrip("/")
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_KEY")
+    or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+    or ""
+)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 TOKEN_TELEGRAM = os.getenv("TOKEN_TELEGRAM")
 ID_TELEGRAM_LUIS = int(os.getenv("ID_TELEGRAM_LUIS", "0"))
@@ -58,14 +83,15 @@ GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 
 VOZ_JARVIS = os.getenv("VOZ_JARVIS", "es-MX-JorgeNeural")
-JARVIS_WEB_PORT = int(os.getenv("JARVIS_WEB_PORT", "8050"))
-NOMBRE_AGENCIA = os.getenv("NOMBRE_AGENCIA", "GuiporDI Soluciones / Telotengo Solutions")
+JARVIS_WEB_PORT = int(os.getenv("JARVIS_WEB_PORT", "3000"))
+NOMBRE_AGENCIA = os.getenv("NOMBRE_AGENCIA", "GuiporDI Soluciones")
 NOMBRE_JEFE = os.getenv("NOMBRE_JEFE", "Luis Castillo")
 
 MODELO_AUDIO = "whisper-large-v3"
 TEMPERATURA = 0.2
-LIMITE_MEMORIA_CORTA = 12
+LIMITE_MEMORIA_CORTA = 14
 ARCHIVO_DB_LOCAL = "jarvis_respaldo_local.db"
+RUTA_ULTIMA_FIRMA = os.path.join("contratos_pdf", "ultima_firma_cliente.png")
 
 SCOPES_GOOGLE = [
     'https://www.googleapis.com/auth/calendar',
@@ -84,18 +110,66 @@ os.makedirs("temp_videos", exist_ok=True)
 os.makedirs("contratos_pdf", exist_ok=True)
 
 # =====================================================================
-# 2. CONECTOR INTELIGENTE SUPABASE + RESPALDO LOCAL (SQLITE)
+# 2. CONECTOR UNIFICADO SUPABASE (REST / POSTGRES) + RESPALDO SQLITE
 # =====================================================================
-def supabase_activo() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY and "supabase.co" in SUPABASE_URL)
+def supabase_rest_activo() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
 
-def sb_headers() -> dict:
+def base_datos_activa() -> bool:
+    return supabase_rest_activo() or bool(DATABASE_URL)
+
+def _sb_headers(prefer: str = "return=representation") -> dict:
     return {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation"
+        "Prefer": prefer
     }
+
+def sb_rest_query(method: str, tabla: str, query_params: str = "", payload: dict = None):
+    """Ejecuta operaciones contra las tablas jarvis_* en Supabase vía REST API."""
+    if not supabase_rest_activo():
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/{tabla}"
+    if query_params:
+        url = f"{url}?{query_params}"
+    try:
+        res = requests.request(
+            method=method.upper(),
+            url=url,
+            headers=_sb_headers(),
+            json=payload,
+            timeout=15
+        )
+        if res.status_code in [200, 201]:
+            return res.json() if res.text.strip() else []
+        elif res.status_code == 204:
+            return []
+        else:
+            logger.warning(f"Supabase REST [{method} {tabla}] ({res.status_code}): {res.text[:200]}")
+            return None
+    except Exception as e:
+        logger.warning(f"Fallo conexión Supabase REST ({tabla}): {e}")
+        return None
+
+def ejecutar_consulta_postgres(query: str, params: tuple = None, fetch: bool = False, fetchall: bool = True):
+    """Respaldo por conexión directa PostgreSQL si no hay SUPABASE_KEY pero sí DATABASE_URL."""
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(query, params)
+        resultado = None
+        if fetch:
+            resultado = cursor.fetchall() if fetchall else cursor.fetchone()
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return resultado
+    except Exception as e:
+        logger.warning(f"Fallo de red hacia Postgres DB: {str(e)}")
+        return None
 
 def inicializar_respaldo_local():
     """Garantiza que Jarvis funcione al 100% incluso si falla la red hacia Supabase."""
@@ -105,7 +179,7 @@ def inicializar_respaldo_local():
         c.execute("""CREATE TABLE IF NOT EXISTS configuracion (clave TEXT PRIMARY KEY, valor TEXT)""")
         c.execute("INSERT OR IGNORE INTO configuracion (clave, valor) VALUES ('hora_despertador', ?)", (HORA_DESPERTADOR_DEFAULT,))
         c.execute("INSERT OR IGNORE INTO configuracion (clave, valor) VALUES ('ultimo_briefing_fecha', '')")
-        
+
         c.execute("""CREATE TABLE IF NOT EXISTS jarvis_proyectos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre_proyecto TEXT, cliente TEXT, estado TEXT, prioridad INTEGER,
@@ -132,8 +206,33 @@ def inicializar_respaldo_local():
 inicializar_respaldo_local()
 
 # =====================================================================
-# 3. HERRAMIENTAS DE PROYECTOS, TAREAS, FINANZAS Y MEMORIA (SUPABASE)
+# 3. HERRAMIENTAS DE PROYECTOS, TAREAS, FINANZAS Y MEMORIA (SUPABASE + LOCAL)
 # =====================================================================
+def _obtener_proyectos_lista() -> tuple[list, str]:
+    """Devuelve (lista_proyectos, origen_texto) desde Supabase o SQLite local."""
+    if supabase_rest_activo():
+        res = sb_rest_query("GET", "jarvis_proyectos", "select=*&order=prioridad.asc,id.asc")
+        if res is not None:
+            return res, "Supabase ☁️"
+
+    if DATABASE_URL:
+        res_pg = ejecutar_consulta_postgres("SELECT * FROM jarvis_proyectos ORDER BY prioridad ASC, id ASC;", fetch=True)
+        if res_pg is not None:
+            return [dict(r) for r in res_pg], "Postgres ☁️"
+
+    filas = []
+    with db_lock:
+        conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
+        c = conn.cursor()
+        c.execute("SELECT id, nombre_proyecto, cliente, estado, prioridad, monto_acordado, monto_cobrado, fecha_entrega, siguiente_paso, notas FROM jarvis_proyectos ORDER BY prioridad ASC, id ASC")
+        for r in c.fetchall():
+            filas.append({
+                "id": r[0], "nombre_proyecto": r[1], "cliente": r[2], "estado": r[3],
+                "prioridad": r[4], "monto_acordado": r[5], "monto_cobrado": r[6],
+                "fecha_entrega": r[7], "siguiente_paso": r[8], "notas": r[9]
+            })
+        conn.close()
+    return filas, "Base Local 💾"
 
 def registrar_o_actualizar_proyecto(
     nombre_proyecto: str,
@@ -146,71 +245,107 @@ def registrar_o_actualizar_proyecto(
     siguiente_paso: str = "",
     notas: str = ""
 ) -> str:
-    payload = {
-        "nombre_proyecto": nombre_proyecto,
-        "cliente": cliente,
+    prio_int = max(1, min(4, int(prioridad or 1)))
+    acordado_f = float(monto_acordado or 0.0)
+    cobrado_f = float(monto_cobrado or 0.0)
+
+    # Verificar si ya existe el proyecto para actualizarlo en lugar de duplicarlo
+    proyectos_actuales, _ = _obtener_proyectos_lista()
+    existente = None
+    nom_low = nombre_proyecto.strip().lower()
+    cli_low = cliente.strip().lower()
+    for p in proyectos_actuales:
+        p_nom = str(p.get("nombre_proyecto") or "").strip().lower()
+        p_cli = str(p.get("cliente") or "").strip().lower()
+        if p_nom == nom_low or (nom_low in p_nom and p_cli == cli_low):
+            existente = p
+            break
+
+    if existente:
+        nuevo_acordado = acordado_f if acordado_f > 0 else float(existente.get("monto_acordado") or 0.0)
+        nuevo_cobrado = cobrado_f if cobrado_f > 0 else float(existente.get("monto_cobrado") or 0.0)
+        nueva_meta = fecha_entrega if fecha_entrega != "Cuando el jefe indique" else (existente.get("fecha_entrega") or fecha_entrega)
+        nuevo_paso = siguiente_paso or existente.get("siguiente_paso") or ""
+        nuevas_notas = notas or existente.get("notas") or ""
+        saldo_pendiente = max(0.0, nuevo_acordado - nuevo_cobrado)
+
+        datos_update = {
+            "nombre_proyecto": nombre_proyecto.strip(),
+            "cliente": cliente.strip(),
+            "estado": estado,
+            "prioridad": prio_int,
+            "monto_acordado": nuevo_acordado,
+            "monto_cobrado": nuevo_cobrado,
+            "fecha_entrega": nueva_meta,
+            "siguiente_paso": nuevo_paso,
+            "notas": nuevas_notas
+        }
+
+        actualizado_nube = False
+        if supabase_rest_activo():
+            res_up = sb_rest_query("PATCH", "jarvis_proyectos", f"id=eq.{existente['id']}", datos_update)
+            actualizado_nube = res_up is not None
+
+        with db_lock:
+            conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
+            c = conn.cursor()
+            c.execute(
+                """UPDATE jarvis_proyectos
+                   SET estado=?, prioridad=?, monto_acordado=?, monto_cobrado=?, fecha_entrega=?, siguiente_paso=?, notas=?
+                   WHERE id=? OR lower(nombre_proyecto)=?""",
+                (estado, prio_int, nuevo_acordado, nuevo_cobrado, nueva_meta, nuevo_paso, nuevas_notas, existente["id"], nom_low)
+            )
+            conn.commit()
+            conn.close()
+
+        origen_lbl = "SUPABASE" if actualizado_nube else "LOCAL"
+        return (
+            f"🗂️ *[PROYECTO ACTUALIZADO EN {origen_lbl} — ID #{existente['id']}]*\n"
+            f"• *Proyecto:* {nombre_proyecto} ({cliente})\n"
+            f"• *Estado:* `{estado}` — *Meta:* {nueva_meta}\n"
+            f"• *Finanzas:* Acordado USD {nuevo_acordado:,.2f} — Cobrado USD {nuevo_cobrado:,.2f} — *Por cobrar: USD {saldo_pendiente:,.2f}*\n"
+            f"• *Siguiente paso:* {nuevo_paso}"
+        )
+
+    saldo_pendiente = max(0.0, acordado_f - cobrado_f)
+    payload_nuevo = {
+        "nombre_proyecto": nombre_proyecto.strip(),
+        "cliente": cliente.strip(),
         "estado": estado,
-        "prioridad": int(prioridad),
-        "monto_acordado": float(monto_acordado),
-        "monto_cobrado": float(monto_cobrado),
+        "prioridad": prio_int,
+        "monto_acordado": acordado_f,
+        "monto_cobrado": cobrado_f,
         "fecha_entrega": fecha_entrega,
         "siguiente_paso": siguiente_paso,
         "notas": notas
     }
-    saldo_pendiente = float(monto_acordado) - float(monto_cobrado)
-    
-    if supabase_activo():
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/jarvis_proyectos"
-            res = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
-            if res.status_code in [200, 201]:
-                return (
-                    f"🗂️ *[PROYECTO GUARDADO EN SUPABASE]*\n"
-                    f"• *Proyecto:* {nombre_proyecto} ({cliente})\n"
-                    f"• *Estado:* {estado} — *Meta:* {fecha_entrega}\n"
-                    f"• *Finanzas:* Acordado USD {monto_acordado:,.2f} — Cobrado USD {monto_cobrado:,.2f} — *Por cobrar: USD {saldo_pendiente:,.2f}*\n"
-                    f"• *Siguiente paso:* {siguiente_paso}"
-                )
-        except Exception as e:
-            logger.warning(f"Fallo Supabase en proyecto: {e}")
+
+    guardado_nube = False
+    if supabase_rest_activo():
+        res_ins = sb_rest_query("POST", "jarvis_proyectos", payload=payload_nuevo)
+        guardado_nube = res_ins is not None
 
     with db_lock:
         conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
         c = conn.cursor()
         c.execute(
             "INSERT INTO jarvis_proyectos (nombre_proyecto, cliente, estado, prioridad, monto_acordado, monto_cobrado, fecha_entrega, siguiente_paso, notas) VALUES (?,?,?,?,?,?,?,?,?)",
-            (nombre_proyecto, cliente, estado, int(prioridad), float(monto_acordado), float(monto_cobrado), fecha_entrega, siguiente_paso, notas)
+            (nombre_proyecto.strip(), cliente.strip(), estado, prio_int, acordado_f, cobrado_f, fecha_entrega, siguiente_paso, notas)
         )
         conn.commit()
         conn.close()
-    return f"🗂️ *[PROYECTO REGISTRADO]*: '{nombre_proyecto}' ({cliente}) — Por cobrar: USD {saldo_pendiente:,.2f}"
+
+    origen_lbl = "SUPABASE" if guardado_nube else "LOCAL"
+    return (
+        f"🗂️ *[PROYECTO GUARDADO EN {origen_lbl}]*\n"
+        f"• *Proyecto:* {nombre_proyecto} ({cliente})\n"
+        f"• *Estado:* `{estado}` — *Meta:* {fecha_entrega}\n"
+        f"• *Finanzas:* Acordado USD {acordado_f:,.2f} — Cobrado USD {cobrado_f:,.2f} — *Por cobrar: USD {saldo_pendiente:,.2f}*\n"
+        f"• *Siguiente paso:* {siguiente_paso}"
+    )
 
 def consultar_tablero_proyectos() -> str:
-    filas = []
-    origen = "Supabase ☁️" if supabase_activo() else "Base Local 💾"
-    
-    if supabase_activo():
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/jarvis_proyectos?select=*&order=prioridad.asc,id.asc"
-            res = requests.get(url, headers=sb_headers(), timeout=10)
-            if res.status_code == 200:
-                filas = res.json()
-        except Exception as e:
-            logger.warning(f"Error consultando proyectos: {e}")
-
-    if not filas:
-        with db_lock:
-            conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
-            c = conn.cursor()
-            c.execute("SELECT id, nombre_proyecto, cliente, estado, prioridad, monto_acordado, monto_cobrado, fecha_entrega, siguiente_paso, notas FROM jarvis_proyectos ORDER BY prioridad ASC, id ASC")
-            for r in c.fetchall():
-                filas.append({
-                    "id": r[0], "nombre_proyecto": r[1], "cliente": r[2], "estado": r[3],
-                    "prioridad": r[4], "monto_acordado": r[5], "monto_cobrado": r[6],
-                    "fecha_entrega": r[7], "siguiente_paso": r[8], "notas": r[9]
-                })
-            conn.close()
-
+    filas, origen = _obtener_proyectos_lista()
     if not filas:
         return "📭 No hay proyectos registrados todavía."
 
@@ -219,22 +354,25 @@ def consultar_tablero_proyectos() -> str:
     lineas = [f"🚀 *TABLERO EJECUTIVO DE PROYECTOS ({origen})*\n"]
 
     for p in filas:
-        acordado = float(p.get("monto_acordado") or 0)
-        cobrado = float(p.get("monto_cobrado") or 0)
-        pendiente = acordado - cobrado
+        acordado = float(p.get("monto_acordado") or 0.0)
+        cobrado = float(p.get("monto_cobrado") or 0.0)
+        pendiente = max(0.0, acordado - cobrado)
         total_acordado += acordado
         total_cobrado += cobrado
 
-        info_dinero = f"💰 Cotizado: USD {acordado:,.2f} — Cobrado: USD {cobrado:,.2f} — *Resta: USD {pendiente:,.2f}*" if acordado > 0 else "💵 _Monto aún por definir_"
+        info_dinero = (
+            f"💰 Cotizado: USD {acordado:,.2f} — Cobrado: USD {cobrado:,.2f} — *Resta: USD {pendiente:,.2f}*"
+            if acordado > 0 else "💵 _Monto aún por definir_"
+        )
         notas_txt = f"\n   • *Notas:* {p.get('notas')}" if p.get("notas") else ""
         lineas.append(
-            f"🔹 *#{p.get('id')} - {p.get('nombre_proyecto')}* ({p.get('cliente')})\n"
-            f"   • *Fase:* `{p.get('estado')}` — *Meta:* {p.get('fecha_entrega')}\n"
+            f"🔹 *#{p.get('id')} - {p.get('nombre_proyecto')}* ({p.get('cliente')}) [P{p.get('prioridad', 1)}]\n"
+            f"   • *Fase:* `{p.get('estado')}` — *Meta:* {p.get('fecha_entrega') or 'Cuando el jefe indique'}\n"
             f"   • {info_dinero}\n"
-            f"   • *Acción:* {p.get('siguiente_paso')}{notas_txt}\n"
+            f"   • *Acción:* {p.get('siguiente_paso') or 'Pendiente de definir'}{notas_txt}\n"
         )
 
-    total_calle = total_acordado - total_cobrado
+    total_calle = max(0.0, total_acordado - total_cobrado)
     lineas.append(
         f"----------------------------------------\n"
         f"📊 *RESUMEN DE CARTERA:*\n"
@@ -244,58 +382,63 @@ def consultar_tablero_proyectos() -> str:
     )
     return "\n".join(lineas)
 
-def agregar_tarea_agenda(titulo: str, cliente_o_proyecto: str = "General", fecha_limite: str = "Cuando el jefe indique", nivel_prioridad: int = 1, descripcion: str = "") -> str:
+def agregar_tarea_agenda(
+    titulo: str,
+    cliente_o_proyecto: str = "General",
+    fecha_limite: str = "Cuando el jefe indique",
+    nivel_prioridad: int = 1,
+    descripcion: str = ""
+) -> str:
     mapa = {
         1: "🔴 1 - CRÍTICA (Ya pagó / Entrega o Reunión Inminente)",
         2: "🟠 2 - ALTA (Clonación rápida / Proyecto en curso)",
         3: "🟡 3 - MEDIA (Demo para prospecto)",
         4: "🟢 4 - BAJA (Idea / Sin urgencia)"
     }
-    prio = max(1, min(4, int(nivel_prioridad)))
+    prio = max(1, min(4, int(nivel_prioridad or 1)))
     etiqueta = mapa.get(prio, "🟠 2 - ALTA")
 
-    if supabase_activo():
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/jarvis_tareas"
-            payload = {
-                "titulo": titulo, "cliente_o_proyecto": cliente_o_proyecto, "prioridad": prio,
-                "etiqueta_prioridad": etiqueta, "fecha_limite": fecha_limite, "descripcion": descripcion, "estado": "pendiente"
-            }
-            res = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
-            if res.status_code in [200, 201]:
-                datos = res.json()
-                t_id = datos[0].get("id") if isinstance(datos, list) and datos else "OK"
-                return f"✅ *[TAREA #{t_id} EN SUPABASE]*: '{titulo}'\n• *Cliente/Nicho:* {cliente_o_proyecto}\n• *Prioridad:* {etiqueta}\n• *Tiempo asignado:* {fecha_limite}"
-        except Exception as e:
-            logger.warning(f"Fallback local en tarea: {e}")
+    payload_tarea = {
+        "titulo": titulo.strip(),
+        "cliente_o_proyecto": cliente_o_proyecto.strip(),
+        "prioridad": prio,
+        "etiqueta_prioridad": etiqueta,
+        "fecha_limite": fecha_limite,
+        "descripcion": descripcion,
+        "estado": "pendiente"
+    }
+
+    t_id = None
+    if supabase_rest_activo():
+        res_sb = sb_rest_query("POST", "jarvis_tareas", payload=payload_tarea)
+        if res_sb and isinstance(res_sb, list) and len(res_sb) > 0:
+            t_id = res_sb[0].get("id")
 
     with db_lock:
         conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
         c = conn.cursor()
         c.execute(
             "INSERT INTO jarvis_tareas (titulo, cliente_o_proyecto, prioridad, etiqueta_prioridad, fecha_limite, descripcion, estado) VALUES (?,?,?,?,?,?, 'pendiente')",
-            (titulo, cliente_o_proyecto, prio, etiqueta, fecha_limite, descripcion)
+            (titulo.strip(), cliente_o_proyecto.strip(), prio, etiqueta, fecha_limite, descripcion)
         )
-        t_id = c.lastrowid
+        if not t_id:
+            t_id = c.lastrowid
         conn.commit()
         conn.close()
-    return f"✅ *[TAREA #{t_id} ANOTADA]*: '{titulo}' ({etiqueta}) — Tiempo: {fecha_limite}."
+
+    return f"✅ *[TAREA #{t_id} ANOTADA EN SUPABASE]*: '{titulo}' ({etiqueta}) — Tiempo: {fecha_limite}."
 
 def consultar_agenda_priorizada(estado: str = "pendiente") -> str:
     filas = []
-    origen = "Supabase ☁️" if supabase_activo() else "Base Local 💾"
+    origen = "Supabase ☁️" if supabase_rest_activo() else "Base Local 💾"
 
-    if supabase_activo():
-        try:
-            filtro = "" if estado == "todas" else f"&estado=eq.{estado}"
-            url = f"{SUPABASE_URL}/rest/v1/jarvis_tareas?select=*{filtro}&order=prioridad.asc,id.asc"
-            res = requests.get(url, headers=sb_headers(), timeout=10)
-            if res.status_code == 200:
-                filas = res.json()
-        except Exception as e:
-            logger.warning(f"Error leyendo tareas en Supabase: {e}")
+    if supabase_rest_activo():
+        filtro = "select=*&order=prioridad.asc,id.asc" if estado == "todas" else f"select=*&estado=eq.{estado}&order=prioridad.asc,id.asc"
+        res_sb = sb_rest_query("GET", "jarvis_tareas", filtro)
+        if res_sb is not None:
+            filas = res_sb
 
-    if not filas:
+    if not filas and not supabase_rest_activo():
         with db_lock:
             conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
             c = conn.cursor()
@@ -326,82 +469,87 @@ def consultar_agenda_priorizada(estado: str = "pendiente") -> str:
     return "\n".join(lineas)
 
 def cambiar_estado_tarea(id_tarea: int, nuevo_estado: str = "completada", nueva_fecha: str = "") -> str:
-    datos_update = {"estado": nuevo_estado.lower()}
+    estado_clean = nuevo_estado.lower().strip()
+    datos_patch = {"estado": estado_clean}
     if nueva_fecha:
-        datos_update["fecha_limite"] = nueva_fecha
+        datos_patch["fecha_limite"] = nueva_fecha
 
-    if supabase_activo():
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/jarvis_tareas?id=eq.{int(id_tarea)}"
-            res = requests.patch(url, headers=sb_headers(), json=datos_update, timeout=10)
-            if res.status_code in [200, 204]:
-                return f"✅ Tarea #{id_tarea} actualizada a: *{nuevo_estado.upper()}*."
-        except Exception as e:
-            logger.warning(f"Error actualizando tarea en Supabase: {e}")
+    if supabase_rest_activo():
+        sb_rest_query("PATCH", "jarvis_tareas", f"id=eq.{int(id_tarea)}", datos_patch)
 
     with db_lock:
         conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
         c = conn.cursor()
         if nueva_fecha:
-            c.execute("UPDATE jarvis_tareas SET estado = ?, fecha_limite = ? WHERE id = ?", (nuevo_estado.lower(), nueva_fecha, int(id_tarea)))
+            c.execute("UPDATE jarvis_tareas SET estado = ?, fecha_limite = ? WHERE id = ?", (estado_clean, nueva_fecha, int(id_tarea)))
         else:
-            c.execute("UPDATE jarvis_tareas SET estado = ? WHERE id = ?", (nuevo_estado.lower(), int(id_tarea)))
+            c.execute("UPDATE jarvis_tareas SET estado = ? WHERE id = ?", (estado_clean, int(id_tarea)))
         conn.commit()
         conn.close()
-    return f"✅ Tarea #{id_tarea} marcada como *{nuevo_estado.upper()}*."
+    return f"✅ Tarea #{id_tarea} marcada como *{estado_clean.upper()}* en Supabase."
 
-def registrar_movimiento_financiero(tipo: str, monto: float, concepto: str, cliente_o_proyecto: str = "Agencia", metodo_pago: str = "General", moneda: str = "USD") -> str:
+def registrar_movimiento_financiero(
+    tipo: str,
+    monto: float,
+    concepto: str,
+    cliente_o_proyecto: str = "Agencia",
+    metodo_pago: str = "General",
+    moneda: str = "USD"
+) -> str:
     tipo_limpio = tipo.lower().strip()
     if tipo_limpio not in ["cobro", "gasto", "inversion"]:
         tipo_limpio = "gasto" if "gast" in tipo_limpio else ("inversion" if "inver" in tipo_limpio else "cobro")
-    
-    fecha_hoy = str(datetime.date.today())
-    payload = {
-        "tipo": tipo_limpio, "monto": float(monto), "moneda": moneda.upper(),
-        "concepto": concepto, "cliente_o_proyecto": cliente_o_proyecto,
-        "metodo_pago": metodo_pago.strip(), "fecha": fecha_hoy
-    }
 
     icono = "💵" if tipo_limpio == "cobro" else ("💸" if tipo_limpio == "gasto" else "🚀")
-    if supabase_activo():
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/jarvis_finanzas"
-            res = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
-            if res.status_code in [200, 201]:
-                return (
-                    f"{icono} *[FINANZAS SUPABASE - {tipo_limpio.upper()} REGISTRADO]*\n"
-                    f"• *Monto:* USD {float(monto):,.2f} ({moneda.upper()})\n"
-                    f"• *Cuenta/Método:* {metodo_pago}\n"
-                    f"• *Concepto:* {concepto} ({cliente_o_proyecto})"
-                )
-        except Exception as e:
-            logger.warning(f"Error guardando finanza en Supabase: {e}")
+    fecha_hoy = hoy_local_str()
+    monto_f = float(monto or 0.0)
+    metodo_clean = (metodo_pago or "General").strip()
+    moneda_clean = (moneda or "USD").upper().strip()
+
+    payload_fin = {
+        "tipo": tipo_limpio,
+        "monto": monto_f,
+        "moneda": moneda_clean,
+        "concepto": concepto.strip(),
+        "cliente_o_proyecto": cliente_o_proyecto.strip(),
+        "metodo_pago": metodo_clean,
+        "fecha": fecha_hoy
+    }
+
+    en_nube = False
+    if supabase_rest_activo():
+        res_sb = sb_rest_query("POST", "jarvis_finanzas", payload=payload_fin)
+        en_nube = res_sb is not None
 
     with db_lock:
         conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
         c = conn.cursor()
         c.execute(
             "INSERT INTO jarvis_finanzas (tipo, monto, moneda, concepto, cliente_o_proyecto, metodo_pago, fecha) VALUES (?,?,?,?,?,?,?)",
-            (tipo_limpio, float(monto), moneda.upper(), concepto, cliente_o_proyecto, metodo_pago.strip(), fecha_hoy)
+            (tipo_limpio, monto_f, moneda_clean, concepto.strip(), cliente_o_proyecto.strip(), metodo_clean, fecha_hoy)
         )
         conn.commit()
         conn.close()
-    return f"{icono} *[{tipo_limpio.upper()} REGISTRADO]*: USD {float(monto):,.2f} {moneda.upper()} en {metodo_pago} - {concepto}."
+
+    origen_lbl = "SUPABASE" if en_nube else "LOCAL"
+    return (
+        f"{icono} *[FINANZAS {origen_lbl} - {tipo_limpio.upper()} REGISTRADO]*\n"
+        f"• *Monto:* USD {monto_f:,.2f} ({moneda_clean})\n"
+        f"• *Cuenta/Método:* {metodo_clean}\n"
+        f"• *Concepto:* {concepto} ({cliente_o_proyecto})\n"
+        f"• *Fecha:* {fecha_hoy}"
+    )
 
 def consultar_reporte_financiero(filtro_cliente: str = "") -> str:
     filas = []
-    origen = "Supabase ☁️" if supabase_activo() else "Base Local 💾"
+    origen = "Supabase ☁️" if supabase_rest_activo() else "Base Local 💾"
 
-    if supabase_activo():
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/jarvis_finanzas?select=*&order=id.desc&limit=100"
-            res = requests.get(url, headers=sb_headers(), timeout=10)
-            if res.status_code == 200:
-                filas = res.json()
-        except Exception as e:
-            logger.warning(f"Error leyendo finanzas de Supabase: {e}")
+    if supabase_rest_activo():
+        res_sb = sb_rest_query("GET", "jarvis_finanzas", "select=*&order=id.desc&limit=100")
+        if res_sb is not None:
+            filas = res_sb
 
-    if not filas:
+    if not filas and not supabase_rest_activo():
         with db_lock:
             conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
             c = conn.cursor()
@@ -413,33 +561,35 @@ def consultar_reporte_financiero(filtro_cliente: str = "") -> str:
                 })
             conn.close()
 
-    plata_en_la_calle = 0.0
-    if supabase_activo():
-        try:
-            res_p = requests.get(f"{SUPABASE_URL}/rest/v1/jarvis_proyectos?select=monto_acordado,monto_cobrado", headers=sb_headers(), timeout=8)
-            if res_p.status_code == 200:
-                for pr in res_p.json():
-                    plata_en_la_calle += (float(pr.get("monto_acordado") or 0) - float(pr.get("monto_cobrado") or 0))
-        except Exception:
-            pass
+    # Calcular Plata en la Calle real desde jarvis_proyectos
+    proyectos_actuales, _ = _obtener_proyectos_lista()
+    plata_en_la_calle = sum(
+        max(0.0, float(p.get("monto_acordado") or 0.0) - float(p.get("monto_cobrado") or 0.0))
+        for p in proyectos_actuales
+    )
 
     if not filas and plata_en_la_calle == 0:
         return "📊 Aún no hay movimientos financieros registrados."
 
     if filtro_cliente:
         f_low = filtro_cliente.lower()
-        filas = [x for x in filas if f_low in str(x.get("cliente_o_proyecto", "")).lower() or f_low in str(x.get("concepto", "")).lower() or f_low in str(x.get("metodo_pago", "")).lower()]
+        filas = [
+            x for x in filas
+            if f_low in str(x.get("cliente_o_proyecto", "")).lower()
+            or f_low in str(x.get("concepto", "")).lower()
+            or f_low in str(x.get("metodo_pago", "")).lower()
+        ]
 
-    total_cobros = sum(float(x.get("monto", 0)) for x in filas if x.get("tipo") == "cobro")
-    total_gastos = sum(float(x.get("monto", 0)) for x in filas if x.get("tipo") == "gasto")
-    total_inversiones = sum(float(x.get("monto", 0)) for x in filas if x.get("tipo") == "inversion")
+    total_cobros = sum(float(x.get("monto") or 0.0) for x in filas if str(x.get("tipo", "")).lower() == "cobro")
+    total_gastos = sum(float(x.get("monto") or 0.0) for x in filas if str(x.get("tipo", "")).lower() == "gasto")
+    total_inversiones = sum(float(x.get("monto") or 0.0) for x in filas if str(x.get("tipo", "")).lower() == "inversion")
     flujo_neto = total_cobros - (total_gastos + total_inversiones)
 
     saldos_por_cuenta = {}
     for x in filas:
         cuenta = (x.get("metodo_pago") or "General").strip().title()
-        monto_m = float(x.get("monto", 0))
-        if x.get("tipo") == "cobro":
+        monto_m = float(x.get("monto") or 0.0)
+        if str(x.get("tipo", "")).lower() == "cobro":
             saldos_por_cuenta[cuenta] = saldos_por_cuenta.get(cuenta, 0.0) + monto_m
         else:
             saldos_por_cuenta[cuenta] = saldos_por_cuenta.get(cuenta, 0.0) - monto_m
@@ -459,59 +609,68 @@ def consultar_reporte_financiero(filtro_cliente: str = "") -> str:
             lineas.append(f"   • *{cta}:* USD {saldo_cta:,.2f}")
         lineas.append("")
 
-    lineas.append("📜 *Últimos Movimientos:*")
-    for m in filas[:10]:
-        t = m.get("tipo", "cobro")
-        ico = "🟢 Cobro" if t == "cobro" else ("🔴 Gasto" if t == "gasto" else "🚀 Inversión")
-        cta_txt = m.get("metodo_pago") or "General"
-        lineas.append(f"• [{m.get('fecha')}] {ico} ({cta_txt}): *USD {float(m.get('monto', 0)):,.2f}* — {m.get('concepto')} (_{m.get('cliente_o_proyecto')}_)")
+    if filas:
+        lineas.append("📜 *Últimos Movimientos:*")
+        for m in filas[:10]:
+            t = str(m.get("tipo") or "cobro").lower()
+            ico = "🟢 Cobro" if t == "cobro" else ("🔴 Gasto" if t == "gasto" else "🚀 Inversión")
+            cta_txt = m.get("metodo_pago") or "General"
+            lineas.append(
+                f"• [{m.get('fecha') or hoy_local_str()}] {ico} ({cta_txt}): *USD {float(m.get('monto') or 0):,.2f}* — {m.get('concepto')} (_{m.get('cliente_o_proyecto')}_)"
+            )
 
     return "\n".join(lineas)
 
-def guardar_en_boveda_memoria(cliente_o_tema: str, detalle_completo: str, categoria: str = "acuerdo_cliente") -> str:
-    fecha_hoy = str(datetime.date.today())
-    payload = {
-        "categoria": categoria, "cliente_o_tema": cliente_o_tema, "detalle_completo": detalle_completo, "fecha": fecha_hoy
+def guardar_en_boveda_memoria(cliente_o_tema: str = "General", detalle_completo: str = "", categoria: str = "acuerdo_cliente", **kwargs) -> str:
+    detalle_completo = detalle_completo or kwargs.get("palabra_clave", "Dato registrado")
+    fecha_hoy = hoy_local_str()
+
+    payload_mem = {
+        "categoria": categoria.strip(),
+        "cliente_o_tema": cliente_o_tema.strip(),
+        "detalle_completo": detalle_completo.strip(),
+        "fecha": fecha_hoy
     }
-    if supabase_activo():
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/jarvis_memoria"
-            res = requests.post(url, headers=sb_headers(), json=payload, timeout=10)
-            if res.status_code in [200, 201]:
-                return f"🧠 *[GUARDADO EN BÓVEDA SUPABASE]*: '{cliente_o_tema}' -> {detalle_completo}"
-        except Exception as e:
-            logger.warning(f"Error guardando en bóveda Supabase: {e}")
+
+    en_nube = False
+    if supabase_rest_activo():
+        res_sb = sb_rest_query("POST", "jarvis_memoria", payload=payload_mem)
+        en_nube = res_sb is not None
 
     with db_lock:
         conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
         c = conn.cursor()
-        c.execute("INSERT INTO jarvis_memoria (categoria, cliente_o_tema, detalle_completo, fecha) VALUES (?,?,?,?)", (categoria, cliente_o_tema, detalle_completo, fecha_hoy))
+        c.execute(
+            "INSERT INTO jarvis_memoria (categoria, cliente_o_tema, detalle_completo, fecha) VALUES (?,?,?,?)",
+            (categoria.strip(), cliente_o_tema.strip(), detalle_completo.strip(), fecha_hoy)
+        )
         conn.commit()
         conn.close()
-    return f"🧠 *[GUARDADO EN BÓVEDA]*: '{cliente_o_tema}' -> {detalle_completo}"
+
+    origen_lbl = "SUPABASE" if en_nube else "LOCAL"
+    return f"🧠 *[GUARDADO EN BÓVEDA {origen_lbl}]*: '{cliente_o_tema}' -> {detalle_completo[:300]}"
 
 def buscar_en_boveda_memoria(palabra_clave: str = "") -> str:
     resultados = []
-    if supabase_activo():
-        try:
-            if palabra_clave:
-                q = palabra_clave.strip()
-                url = f"{SUPABASE_URL}/rest/v1/jarvis_memoria?or=(cliente_o_tema.ilike.*{q}*,detalle_completo.ilike.*{q}*)&order=id.desc&limit=25"
-            else:
-                url = f"{SUPABASE_URL}/rest/v1/jarvis_memoria?select=*&order=id.desc&limit=25"
-            res = requests.get(url, headers=sb_headers(), timeout=10)
-            if res.status_code == 200:
-                resultados = res.json()
-        except Exception as e:
-            logger.warning(f"Error buscando en bóveda Supabase: {e}")
+    kw = (palabra_clave or "").strip()
 
-    if not resultados:
+    if supabase_rest_activo():
+        res_sb = sb_rest_query("GET", "jarvis_memoria", "select=*&order=id.desc&limit=40")
+        if res_sb is not None:
+            for r in res_sb:
+                if not kw or kw.lower() in str(r.get("cliente_o_tema", "")).lower() or kw.lower() in str(r.get("detalle_completo", "")).lower() or kw.lower() in str(r.get("categoria", "")).lower():
+                    resultados.append(r)
+
+    if not resultados and not supabase_rest_activo():
         with db_lock:
             conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
             c = conn.cursor()
-            if palabra_clave:
-                like_q = f"%{palabra_clave}%"
-                c.execute("SELECT fecha, categoria, cliente_o_tema, detalle_completo FROM jarvis_memoria WHERE cliente_o_tema LIKE ? OR detalle_completo LIKE ? ORDER BY id DESC LIMIT 25", (like_q, like_q))
+            if kw:
+                like_q = f"%{kw}%"
+                c.execute(
+                    "SELECT fecha, categoria, cliente_o_tema, detalle_completo FROM jarvis_memoria WHERE cliente_o_tema LIKE ? OR detalle_completo LIKE ? ORDER BY id DESC LIMIT 25",
+                    (like_q, like_q)
+                )
             else:
                 c.execute("SELECT fecha, categoria, cliente_o_tema, detalle_completo FROM jarvis_memoria ORDER BY id DESC LIMIT 25")
             for r in c.fetchall():
@@ -519,11 +678,14 @@ def buscar_en_boveda_memoria(palabra_clave: str = "") -> str:
             conn.close()
 
     if not resultados:
-        return f"📭 No encontré apuntes previos sobre '{palabra_clave}' en la Bóveda."
+        return f"📭 No encontré apuntes previos sobre '{kw}' en la Bóveda."
 
-    lineas = [f"🔍 *[RECUERDOS EN LA BÓVEDA PARA '{palabra_clave or 'TODO'}']*:\n"]
-    for item in resultados:
-        lineas.append(f"• *[{item.get('fecha')}] {item.get('cliente_o_tema')}* ({item.get('categoria')}):\n  _{item.get('detalle_completo')}_")
+    lineas = [f"🔍 *[RECUERDOS EN LA BÓVEDA PARA '{kw or 'TODO'}']*:\n"]
+    for item in resultados[:25]:
+        detalle = str(item.get("detalle_completo") or "")
+        if detalle.startswith("data:image/png;base64,"):
+            detalle = "[Firma Digital Táctil en Base64 lista para estampar en PDF]"
+        lineas.append(f"• *[{item.get('fecha')}] {item.get('cliente_o_tema')}* ({item.get('categoria')}):\n  _{detalle}_")
     return "\n".join(lineas)
 
 def configurar_hora_despertador(hora_24h: str) -> str:
@@ -536,7 +698,7 @@ def configurar_hora_despertador(hora_24h: str) -> str:
             c.execute("INSERT OR REPLACE INTO configuracion (clave, valor) VALUES ('hora_despertador', ?)", (hora_formateada,))
             conn.commit()
             conn.close()
-        return f"⏰ *[DESPERTADOR CONFIGURADO]*: Te despertaré todos los días a las {hora_formateada} con tu agenda, proyectos y finanzas."
+        return f"⏰ *[DESPERTADOR CONFIGURADO]*: Te despertaré todos los días a las {hora_formateada} ({TZ_NAME}) con tu agenda, proyectos y finanzas."
     except Exception:
         return "❌ Formato inválido. Usa formato 24h como '07:30' o '08:00'."
 
@@ -646,13 +808,18 @@ def crear_reunion_google_meet(titulo: str, fecha_hora_iso: str, duracion_minutos
         evento_base = {
             'summary': titulo,
             'description': descripcion or f"Agendado por Jarvis Executive para {NOMBRE_JEFE}",
-            'start': {'dateTime': inicio.isoformat(), 'timeZone': 'America/New_York'},
-            'end': {'dateTime': fin.isoformat(), 'timeZone': 'America/New_York'}
+            'start': {'dateTime': inicio.isoformat(), 'timeZone': TZ_NAME},
+            'end': {'dateTime': fin.isoformat(), 'timeZone': TZ_NAME}
         }
 
         try:
             evento_meet = dict(evento_base)
-            evento_meet['conferenceData'] = {'createRequest': {'requestId': f"req_{int(time.time())}", 'conferenceSolutionKey': {'type': 'hangoutsMeet'}}}
+            evento_meet['conferenceData'] = {
+                'createRequest': {
+                    'requestId': f"req_{int(time.time())}",
+                    'conferenceSolutionKey': {'type': 'hangoutsMeet'}
+                }
+            }
             res = service.events().insert(calendarId=cal_id, body=evento_meet, conferenceDataVersion=1).execute()
         except Exception:
             res = service.events().insert(calendarId=cal_id, body=evento_base).execute()
@@ -664,26 +831,30 @@ def crear_reunion_google_meet(titulo: str, fecha_hora_iso: str, duracion_minutos
             f"📅 *[EVENTO AGENDADO EN GOOGLE CALENDAR]*\n"
             f"• *Título:* {titulo}\n"
             f"• *Calendario:* `{cal_id}`\n"
-            f"• *Inicio:* {inicio.strftime('%Y-%m-%d %H:%M')}\n"
+            f"• *Inicio ({TZ_NAME}):* {inicio.strftime('%Y-%m-%d %H:%M')}\n"
             f"• *Enlace Calendar:* {link_html}{extra_meet}"
         )
     except Exception as e:
         return f"❌ Error agendando en Google Calendar: {str(e)}"
 
 def consultar_eventos_google_calendar(dias_adelante: int = 7) -> str:
-    """Lee los próximos eventos del Google Calendar de Luis."""
+    """Lee los próximos eventos del Google Calendar de Luis en zona horaria local."""
     try:
         creds = autenticar_google()
         if not creds:
             return "⚠️ No hay credenciales de Google activas."
         service = build('calendar', 'v3', credentials=creds)
         cal_id = _obtener_id_calendario_compartido(service)
-        ahora = datetime.datetime.utcnow().isoformat() + 'Z'
-        limite = (datetime.datetime.utcnow() + datetime.timedelta(days=int(dias_adelante))).isoformat() + 'Z'
+        ahora_utc = datetime.datetime.now(datetime.timezone.utc)
+        limite_utc = ahora_utc + datetime.timedelta(days=int(dias_adelante))
 
         eventos_res = service.events().list(
-            calendarId=cal_id, timeMin=ahora, timeMax=limite,
-            maxResults=15, singleEvents=True, orderBy='startTime'
+            calendarId=cal_id,
+            timeMin=ahora_utc.isoformat(),
+            timeMax=limite_utc.isoformat(),
+            maxResults=15,
+            singleEvents=True,
+            orderBy='startTime'
         ).execute()
         items = eventos_res.get('items', [])
         if not items:
@@ -709,7 +880,10 @@ def enviar_correo_resend(destinatario: str, asunto: str, cuerpo_mensaje: str) ->
             json={"from": remitente, "to": [destinatario.strip()], "subject": asunto, "text": cuerpo_mensaje},
             timeout=15
         )
-        return f"✅ *[CORREO ENVIADO CON ÉXITO]*\n• *Para:* {destinatario}\n• *Asunto:* {asunto}" if res.status_code in [200, 201] else f"❌ Error Resend ({res.status_code}): {res.text}"
+        return (
+            f"✅ *[CORREO ENVIADO CON ÉXITO]*\n• *Para:* {destinatario}\n• *Asunto:* {asunto}"
+            if res.status_code in [200, 201] else f"❌ Error Resend ({res.status_code}): {res.text}"
+        )
     except Exception as e:
         return f"❌ Error enviando correo: {str(e)}"
 
@@ -732,8 +906,9 @@ def buscar_archivo_google_drive(nombre_archivo: str = "") -> str:
         if not creds:
             return "⚠️ No hay credenciales de Google activas."
         service = build('drive', 'v3', credentials=creds)
-        if nombre_archivo.strip():
-            query = f"name contains '{nombre_archivo.strip()}' and trashed = false"
+        nombre_limpio = nombre_archivo.strip().replace("'", "")
+        if nombre_limpio:
+            query = f"name contains '{nombre_limpio}' and trashed = false"
         else:
             query = "trashed = false"
         results = service.files().list(q=query, pageSize=15, fields="files(id, name, mimeType, webViewLink)").execute()
@@ -755,7 +930,7 @@ def gestionar_google_sheets(accion: str, spreadsheet_id: str, rango: str = "A1:Z
         if not creds:
             return "⚠️ No hay credenciales de Google activas."
         service = build('sheets', 'v4', credentials=creds)
-        
+
         if accion.lower() == "leer":
             res = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rango).execute()
             datos = res.get('values', [])
@@ -765,7 +940,7 @@ def gestionar_google_sheets(accion: str, spreadsheet_id: str, rango: str = "A1:Z
             for idx, fila in enumerate(datos[:30], start=1):
                 lineas_formateadas.append(f"• *Fila {idx}:* " + " — ".join(str(celda) for celda in fila))
             return "\n".join(lineas_formateadas)
-        
+
         elif accion.lower() in ["escribir", "editar", "agregar"]:
             try:
                 data_array = json.loads(valores_json)
@@ -777,8 +952,11 @@ def gestionar_google_sheets(accion: str, spreadsheet_id: str, rango: str = "A1:Z
                 data_array = [[valores_json]]
             body = {'values': data_array}
             res = service.spreadsheets().values().append(
-                spreadsheetId=spreadsheet_id, range=rango,
-                valueInputOption="USER_ENTERED", body=body).execute()
+                spreadsheetId=spreadsheet_id,
+                range=rango,
+                valueInputOption="USER_ENTERED",
+                body=body
+            ).execute()
             celdas = res.get('updates', {}).get('updatedCells', 0)
             return f"✅ *[GOOGLE SHEETS ACTUALIZADO]*: Se han agregado/editado {celdas} celdas en `{rango}`."
         return "❌ Acción inválida. Usa 'leer' o 'escribir'."
@@ -794,7 +972,6 @@ def extraer_datos_instagram(usuario_o_shortcode: str, palabra_clave_filtro: str 
         if "instagram.com/p/" in objetivo or "instagram.com/reel/" in objetivo:
             objetivo = objetivo.split("/")[-1]
 
-        # Caso 1: Es un Shortcode de un Post/Reel (extraer comentarios)
         if len(objetivo) == 11 and "_" not in objetivo and "." not in objetivo:
             post = instaloader.Post.from_shortcode(L.context, objetivo)
             comentarios = []
@@ -810,7 +987,6 @@ def extraer_datos_instagram(usuario_o_shortcode: str, palabra_clave_filtro: str 
             guardar_en_boveda_memoria(f"Leads Instagram ({objetivo})", resumen[:1500], "leads_scraping")
             return f"📸 *[SCRAPING INSTAGRAM - {len(comentarios)} COMENTARIOS EXTRAÍDOS]*:\n\n{resumen}"
 
-        # Caso 2: Es un Perfil de Usuario (extraer biografía y últimas publicaciones)
         profile = instaloader.Profile.from_username(L.context, objetivo)
         lineas = [
             f"📸 *[PERFIL DE INSTAGRAM: @{profile.username}]*",
@@ -856,13 +1032,40 @@ def scraping_web_profundo(url: str, aguja_a_buscar: str = "") -> str:
             return f"⚠️ No pude extraer texto legible de {url_limpia}."
 
         if aguja_a_buscar:
-            lineas_coincidentes = [ln.strip() for ln in texto_extraido.splitlines() if aguja_a_buscar.lower() in ln.lower() and len(ln.strip()) > 3]
-            extracto = "\n".join(f"• {l[:250]}" for l in lineas_coincidentes[:20]) or "No se halló la palabra exacta, mostrando contenido general:\n" + texto_extraido[:2500]
+            lineas_coincidentes = [
+                ln.strip() for ln in texto_extraido.splitlines()
+                if aguja_a_buscar.lower() in ln.lower() and len(ln.strip()) > 3
+            ]
+            extracto = "\n".join(f"• {l[:250]}" for l in lineas_coincidentes[:20]) or (
+                "No se halló la palabra exacta, mostrando contenido general:\n" + texto_extraido[:2500]
+            )
             return f"🕸️ *[SCRAPING PROFUNDO EN {url_limpia} — Filtro: '{aguja_a_buscar}']*\n\n{extracto}"
 
         return f"🕸️ *[SCRAPING PROFUNDO EN {url_limpia}]*\n\n{texto_extraido[:3200]}"
     except Exception as e:
         return f"❌ Error en Scraping profundo: {str(e)}"
+
+def _obtener_ruta_firma_reciente() -> str:
+    """Busca la última firma digital guardada en Supabase o en el archivo local para estamparla en el PDF."""
+    if supabase_rest_activo():
+        res = sb_rest_query(
+            "GET",
+            "jarvis_memoria",
+            "select=*&categoria=eq.firma_digital&order=id.desc&limit=1"
+        )
+        if res and len(res) > 0:
+            detalle = str(res[0].get("detalle_completo") or "")
+            if detalle.startswith("data:image/png;base64,"):
+                try:
+                    b64_data = detalle.split(",", 1)[1]
+                    with open(RUTA_ULTIMA_FIRMA, "wb") as f:
+                        f.write(base64.b64decode(b64_data))
+                    return RUTA_ULTIMA_FIRMA
+                except Exception as e:
+                    logger.warning(f"No se pudo decodificar firma Base64 desde Supabase: {e}")
+    if os.path.exists(RUTA_ULTIMA_FIRMA):
+        return RUTA_ULTIMA_FIRMA
+    return ""
 
 def generar_contrato_o_documento_formal(
     titulo_documento: str,
@@ -870,10 +1073,10 @@ def generar_contrato_o_documento_formal(
     cuerpo_clausulas: str,
     monto_acordado_usd: float = 0.0
 ) -> str:
-    """Genera un Contrato o Propuesta formal en PDF, lo envía por Telegram a Luis, lo respalda en Google Drive y lo habilita para firma digital con el dedo."""
+    """Genera un Contrato o Propuesta formal en PDF con Firma Táctil si existe, lo envía por Telegram y lo respalda en Drive."""
     try:
         from fpdf import FPDF
-        fecha_str = str(datetime.date.today())
+        fecha_str = hoy_local_str()
         slug_cliente = "".join(c if c.isalnum() else "_" for c in nombre_cliente)[:25]
         nombre_pdf = f"Contrato_{slug_cliente}_{int(time.time())}.pdf"
         ruta_pdf = os.path.join("contratos_pdf", nombre_pdf)
@@ -911,7 +1114,7 @@ def generar_contrato_o_documento_formal(
         pdf.set_font("Helvetica", "B", 11)
         pdf.cell(0, 9, limpiar_latin1(f"  CLIENTE / CONTRATANTE: {nombre_cliente}"), ln=True, fill=True)
         pdf.cell(0, 9, limpiar_latin1(f"  REPRESENTANTE AGENCIA: {NOMBRE_JEFE} ({NOMBRE_AGENCIA})"), ln=True, fill=True)
-        if float(monto_acordado_usd) > 0:
+        if float(monto_acordado_usd or 0) > 0:
             pdf.cell(0, 9, limpiar_latin1(f"  VALOR TOTAL ACORDADO: USD {float(monto_acordado_usd):,.2f}"), ln=True, fill=True)
         pdf.ln(6)
 
@@ -922,7 +1125,7 @@ def generar_contrato_o_documento_formal(
             if not p_limpio:
                 pdf.ln(3)
                 continue
-            if p_limpio.isupper() or p_limpio.startswith("CLAUSULA") or p_limpio.startswith("CLÁUSULA") or p_limpio.startswith("1.") or p_limpio.startswith("2.") or p_limpio.startswith("3."):
+            if p_limpio.isupper() or p_limpio.startswith(("CLAUSULA", "CLÁUSULA", "1.", "2.", "3.", "4.", "5.")):
                 pdf.set_font("Helvetica", "B", 11)
                 pdf.multi_cell(0, 6.5, p_limpio)
                 pdf.set_font("Helvetica", "", 11)
@@ -932,9 +1135,20 @@ def generar_contrato_o_documento_formal(
 
         # Bloque de Firmas Digitales
         pdf.ln(15)
-        if pdf.get_y() > 235:
+        if pdf.get_y() > 225:
             pdf.add_page()
-        y_firma = pdf.get_y() + 15
+        y_firma = pdf.get_y() + 20
+
+        # Estampar Firma Digital del Cliente si fue capturada en el HUD
+        ruta_firma = _obtener_ruta_firma_reciente()
+        firma_estampada = False
+        if ruta_firma and os.path.exists(ruta_firma):
+            try:
+                pdf.image(ruta_firma, x=125, y=y_firma - 18, w=55, h=16)
+                firma_estampada = True
+            except Exception as e_img:
+                logger.warning(f"No se pudo incrustar imagen de firma en PDF: {e_img}")
+
         pdf.set_draw_color(50, 60, 80)
         pdf.line(20, y_firma, 95, y_firma)
         pdf.line(115, y_firma, 190, y_firma)
@@ -960,7 +1174,7 @@ def generar_contrato_o_documento_formal(
                     bot.send_document(
                         ID_TELEGRAM_LUIS,
                         doc_file,
-                        caption=f"📄 *{titulo_documento}*\n👤 *Cliente:* {nombre_cliente}\n✍️ _Listo para imprimir o firmar digitalmente en el HUD Web._",
+                        caption=f"📄 *{titulo_documento}*\n👤 *Cliente:* {nombre_cliente}\n✍️ _{'Firma digital estampada' if firma_estampada else 'Listo para firmar en el HUD Web'}._",
                         parse_mode="Markdown"
                     )
             except Exception as e_tg:
@@ -981,14 +1195,18 @@ def generar_contrato_o_documento_formal(
         except Exception as e_drv:
             logger.warning(f"Nota Drive en contrato: {e_drv}")
 
-        guardar_en_boveda_memoria(nombre_cliente, f"Contrato PDF generado ({nombre_pdf}): {titulo_documento} por USD {monto_acordado_usd}", "contratos")
+        guardar_en_boveda_memoria(
+            nombre_cliente,
+            f"Contrato PDF generado ({nombre_pdf}): {titulo_documento} por USD {monto_acordado_usd}",
+            "contratos"
+        )
         return (
             f"📄 *[CONTRATO / DOCUMENTO PDF GENERADO CON ÉXITO]*\n"
             f"• *Archivo:* `{nombre_pdf}`\n"
             f"• *Cliente:* {nombre_cliente}\n"
-            f"• *Entrega:* Te lo acabo de enviar como PDF adjunto aquí en Telegram.\n"
-            f"• *Respaldo:* {info_drive}\n"
-            f"• *Firma Táctil:* Disponible en la pestaña 'Firma Digital' de tu App Web Tony Stark (Puerto {JARVIS_WEB_PORT})."
+            f"• *Firma Táctil:* {'✅ Estampada automáticamente en el PDF' if firma_estampada else f'Disponible en tu HUD Web (Puerto {JARVIS_WEB_PORT})'}\n"
+            f"• *Entrega:* Enviado como PDF adjunto aquí en Telegram.\n"
+            f"• *Respaldo:* {info_drive}"
         )
     except Exception as e:
         return f"❌ Error generando contrato PDF: {str(e)}"
@@ -998,46 +1216,41 @@ def generar_contrato_o_documento_formal(
 # =====================================================================
 def usuario_pidio_voz(texto: str) -> bool:
     t = texto.lower()
-    triggers = [
-        "con nota de voz", "en nota de voz", "por nota de voz",
-        "con voz", "en audio", "por audio", "respóndeme hablando",
-        "respondeme hablando", "háblame", "hablame", "/voz"
-    ]
-    return any(tr in t for tr in triggers)
+    return any(kw in t for kw in ["voz", "audio", "habla", "háblame", "hablame", "escuchar", "/voz"])
 
 def generar_audio_voz_jarvis(texto_respuesta: str) -> str:
-    """Genera la voz de Jarvis usando el motor XTTS local en el puerto 8020."""
+    """Genera la voz de Jarvis en <1s usando Edge-TTS neuronal en español neutro."""
     import re
-    
-    try:
-        # Limpiar símbolos Markdown y URLs para que el motor lea fluidamente
-        texto_limpio = re.sub(r'[*_`#~>\[\]]', '', texto_respuesta)
-        texto_limpio = re.sub(r'https?://\S+', 'enlace adjunto', texto_limpio)
-        texto_limpio = texto_limpio[:1500].strip()
-        if not texto_limpio:
-            texto_limpio = "Orden ejecutada, jefe."
+    import asyncio
+    import edge_tts
 
-        ruta_salida = os.path.join("temp_audios", f"jarvis_tts_{int(time.time()*1000)}.wav")
-        
-        # Conexión directa a la API local de XTTS
-        url = "http://localhost:8020/v1/audio/speech"
-        payload = {
-            "input": texto_limpio,
-            "voice": "jarvis_listo.wav",
-            "language": "es",
-            "model": "tts-1"
-        }
-        
-        response = requests.post(url, json=payload, timeout=120)
-        if response.status_code == 200:
-            with open(ruta_salida, 'wb') as f:
-                f.write(response.content)
+    try:
+        # Limpiar etiquetas técnicas, Markdown y enlaces
+        texto_limpio = re.sub(r'^\[.*?\]\s*', '', texto_respuesta.strip(), flags=re.DOTALL)
+        texto_limpio = re.sub(r'[*_`#~>\[\]•]', '', texto_limpio)
+        texto_limpio = re.sub(r'https?://\S+', 'enlace adjunto', texto_limpio)
+        texto_limpio = texto_limpio[:1200].strip()
+        if not texto_limpio:
+            texto_limpio = "Sistemas operativos, señor."
+
+        ruta_salida = os.path.join("temp_audios", f"jarvis_voice_{int(time.time()*1000)}.mp3")
+
+        async def _sintetizar():
+            com = edge_tts.Communicate(
+                text=texto_limpio,
+                voice="es-MX-JorgeNeural",
+                pitch="-3Hz",
+                rate="-2%"
+            )
+            await com.save(ruta_salida)
+
+        asyncio.run(_sintetizar())
+
+        if os.path.exists(ruta_salida) and os.path.getsize(ruta_salida) > 0:
             return ruta_salida
-        else:
-            logger.error(f"Error del servidor de voz XTTS: {response.status_code}")
-            return ""
+        return ""
     except Exception as e:
-        logger.error(f"Falla de conexión con el motor XTTS local: {e}")
+        logger.error(f"Falla generando voz con Edge-TTS: {e}")
         return ""
 
 # =====================================================================
@@ -1047,17 +1260,17 @@ CATALOGO_TOOLS = {
     "registrar_o_actualizar_proyecto": {
         "type": "function", "function": {
             "name": "registrar_o_actualizar_proyecto",
-            "description": "Guarda un proyecto o cliente nuevo en Supabase con estado, monto acordado, monto cobrado y siguiente paso.",
+            "description": "Guarda o actualiza un proyecto en la BD. Si ya existe actualiza sus montos y estado.",
             "parameters": {"type": "object", "properties": {"nombre_proyecto": {"type": "string"}, "cliente": {"type": "string"}, "estado": {"type": "string", "enum": ["1_Pagado_En_Curso", "2_Reunion_Critica", "3_Clonar_Ganancia_Rapida", "4_Prospecto_Demo", "Completado"]}, "prioridad": {"type": "integer"}, "monto_acordado": {"type": "number"}, "monto_cobrado": {"type": "number"}, "fecha_entrega": {"type": "string"}, "siguiente_paso": {"type": "string"}, "notas": {"type": "string"}}, "required": ["nombre_proyecto", "cliente", "estado", "prioridad", "siguiente_paso"]}
         }
     },
     "consultar_tablero_proyectos": {
-        "type": "function", "function": {"name": "consultar_tablero_proyectos", "description": "Consulta todos los proyectos activos en Supabase y plata en la calle.", "parameters": {"type": "object", "properties": {}}}
+        "type": "function", "function": {"name": "consultar_tablero_proyectos", "description": "Consulta todos los proyectos activos en la Base de Datos y plata en la calle.", "parameters": {"type": "object", "properties": {}}}
     },
     "agregar_tarea_agenda": {
         "type": "function", "function": {
             "name": "agregar_tarea_agenda",
-            "description": "Anota una tarea o demo pendiente en Supabase respetando los tiempos que indique el jefe.",
+            "description": "Anota una tarea o demo pendiente respetando los tiempos que indique el jefe.",
             "parameters": {"type": "object", "properties": {"titulo": {"type": "string"}, "cliente_o_proyecto": {"type": "string"}, "fecha_limite": {"type": "string"}, "nivel_prioridad": {"type": "integer"}, "descripcion": {"type": "string"}}, "required": ["titulo", "cliente_o_proyecto", "nivel_prioridad"]}
         }
     },
@@ -1074,7 +1287,7 @@ CATALOGO_TOOLS = {
     "registrar_movimiento_financiero": {
         "type": "function", "function": {
             "name": "registrar_movimiento_financiero",
-            "description": "Registra en Supabase un 'cobro', 'gasto' o 'inversion' indicando la cuenta (ej: Binance, Zelle).",
+            "description": "Registra en la Base de Datos un 'cobro', 'gasto' o 'inversion' indicando la cuenta (ej: Binance, Zelle).",
             "parameters": {"type": "object", "properties": {"tipo": {"type": "string", "enum": ["cobro", "gasto", "inversion"]}, "monto": {"type": "number"}, "concepto": {"type": "string"}, "cliente_o_proyecto": {"type": "string"}, "metodo_pago": {"type": "string"}, "moneda": {"type": "string"}}, "required": ["tipo", "monto", "concepto"]}
         }
     },
@@ -1084,12 +1297,12 @@ CATALOGO_TOOLS = {
     "guardar_en_boveda_memoria": {
         "type": "function", "function": {
             "name": "guardar_en_boveda_memoria",
-            "description": "Guarda cualquier apunte, acuerdo o dato clave en Supabase.",
+            "description": "Guarda cualquier apunte, acuerdo o dato clave en la Base de Datos.",
             "parameters": {"type": "object", "properties": {"cliente_o_tema": {"type": "string"}, "detalle_completo": {"type": "string"}, "categoria": {"type": "string"}}, "required": ["cliente_o_tema", "detalle_completo"]}
         }
     },
     "buscar_en_boveda_memoria": {
-        "type": "function", "function": {"name": "buscar_en_boveda_memoria", "description": "Busca en Supabase acuerdos o datos guardados.", "parameters": {"type": "object", "properties": {"palabra_clave": {"type": "string"}}}}
+        "type": "function", "function": {"name": "buscar_en_boveda_memoria", "description": "Busca en la Base de Datos acuerdos o datos guardados.", "parameters": {"type": "object", "properties": {"palabra_clave": {"type": "string"}}}}
     },
     "generar_plan_y_prompt_gemini": {
         "type": "function", "function": {
@@ -1147,7 +1360,7 @@ CATALOGO_TOOLS = {
     "generar_contrato_o_documento_formal": {
         "type": "function", "function": {
             "name": "generar_contrato_o_documento_formal",
-            "description": "Redacta y genera un contrato o presupuesto formal en PDF listo para imprimir o firmar digitalmente, lo envía por Telegram y lo sube a Google Drive.",
+            "description": "Redacta y genera un contrato formal en PDF (estampando firma si existe), lo envía por Telegram y lo sube a Drive.",
             "parameters": {"type": "object", "properties": {"titulo_documento": {"type": "string"}, "nombre_cliente": {"type": "string"}, "cuerpo_clausulas": {"type": "string"}, "monto_acordado_usd": {"type": "number"}}, "required": ["titulo_documento", "nombre_cliente", "cuerpo_clausulas"]}
         }
     }
@@ -1158,23 +1371,16 @@ CATALOGO_TOOLS = {
 # =====================================================================
 class CerebroJarvis:
     def __init__(self):
-        self.system_prompt = f"""[DIRECTIVA DE IDENTIDAD SUPREMA]
-NO eres Kiro. Eres JARVIS: Jefe de Gabinete, CFO y Arquitecto de Sistemas de {NOMBRE_JEFE} en {NOMBRE_AGENCIA}.
-Fecha y hora actual del servidor: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} ({platform.system()}).
-Conexión a Supabase ({SUPABASE_URL}): ACTIVA.
-Conexión a Google Calendar, Drive, Sheets y Resend: ACTIVA EN VIVO.
-
-REGLAS INNEGOCIABLES DE AUTORIDAD Y FORMATO:
-1. PROHIBIDO USAR TABLAS MARKDOWN: Jamás uses tablas con barras verticales en tus respuestas porque Telegram las rompe. Presenta todo en listas limpias con viñetas (•) y emojis.
-2. PROHIBIDO RESUMIR O RECORTAR DATOS: Cuando {NOMBRE_JEFE} pida un reporte de proyectos, tareas o memoria, muéstrale toda la información completa y clara, sin abreviar palabras ni omitir detalles.
-3. EL JEFE DICTA LOS TIEMPOS: Jamás inventes fechas de entrega ni le impongas a {NOMBRE_JEFE} qué día debe hacer una tarea. Si él no especifica fecha o día, regístralo como "Cuando el jefe indique". Solo agenda horas/días específicos cuando él te lo ordene explícitamente.
-4. ACCIÓN CON HERRAMIENTAS:
-   - Reuniones / Horarios: Usa 'crear_reunion_google_meet' o 'consultar_eventos_google_calendar'.
-   - Drive / Sheets: Usa 'buscar_archivo_google_drive' y 'gestionar_google_sheets'.
-   - Búsquedas web / Referencias / Scraping: Usa 'buscar_y_leer_internet', 'scraping_web_profundo' o 'extraer_datos_instagram'.
-   - Contratos / PDFs: Usa 'generar_contrato_o_documento_formal'.
-   - Correos: Usa 'enviar_correo_resend'."""
         self.historial = []
+
+    def get_system_prompt_dinamico(self) -> str:
+        ahora = ahora_local()
+        return f"""Eres JARVIS: Asistente Ejecutivo, Jefe de Gabinete y CFO de {NOMBRE_JEFE} en {NOMBRE_AGENCIA}.
+Fecha y hora actual: {ahora.strftime('%Y-%m-%d %H:%M')} ({TZ_NAME}).
+Tono: Formal, ejecutivo, resolutivo y directo.
+Formato: Usa viñetas limpias (•) y emojis sobrios. NUNCA uses tablas markdown.
+Capacidades: Cuentas con integración total de voz, agenda, finanzas, proyectos y generación de contratos en PDF con firma digital.
+CONTRATOS Y DOCUMENTOS: Cuando el jefe te pida redactar, hacer o generar un contrato, presupuesto, documento legal o PDF, NUNCA respondas con texto plano para copiar ni digas que no puedes generar PDFs; estás OBLIGADO a ejecutar inmediatamente la herramienta 'generar_contrato_o_documento_formal' redactando tú mismo las cláusulas en el argumento 'cuerpo_clausulas' y fijando el monto acordado."""
 
     def seleccionar_micro_herramientas(self, texto: str) -> list:
         t = texto.lower()
@@ -1187,7 +1393,8 @@ REGLAS INNEGOCIABLES DE AUTORIDAD Y FORMATO:
         if any(p in t for p in kw_finanzas):
             seleccion.update(["registrar_movimiento_financiero", "consultar_reporte_financiero", "consultar_tablero_proyectos"])
 
-        kw_operaciones = ["anota", "agrega", "agenda", "tarea", "pendiente", "prioridad", "proyecto", "cliente", "concreté", "cerré", "demo", "aplicación", "web", "página", "ferretería", "carros", "agencia", "iglesia", "clonar", "procrastinador", "informe", "reporte", "resumen", "estado", "qué tenemos", "qué tengo", "qué hay", "hoy", "recuerda", "olvidé", "acuerdo", "quedamos", "bóveda", "memoria", "supabase", "terminé", "semana", "/hacer"]
+        kw_operaciones = ["anota", "agrega", "agenda", "tarea", "pendiente", "prioridad", "proyecto", "cliente", "concreté", "cerré", "demo", "aplicación", "web", "página", "ferretería", "carros", "agencia", "iglesia", "clonar", "procrastinador", "informe", "reporte", "resumen", "estado", "qué tenemos", "qué tengo", "qué hay", "hoy", "recuerda", "olvidé", "acuerdo", "quedamos", "bóveda", "memoria", "supabase", "local", "terminé", "semana", "hazlo", "pásalo", "cóbramelos", "/hacer", "actualiza"]
+        # 🟢 Reparación: Incluidos pronombres como "hazlo", "pásalo" para que no pierda las tools de seguimiento
         if any(p in t for p in kw_operaciones):
             seleccion.update(["agregar_tarea_agenda", "consultar_agenda_priorizada", "cambiar_estado_tarea", "registrar_o_actualizar_proyecto", "consultar_tablero_proyectos", "guardar_en_boveda_memoria", "buscar_en_boveda_memoria", "consultar_reporte_financiero"])
 
@@ -1203,7 +1410,7 @@ REGLAS INNEGOCIABLES DE AUTORIDAD Y FORMATO:
         if any(p in t for p in kw_web_scraping):
             seleccion.update(["buscar_y_leer_internet", "scraping_web_profundo", "extraer_datos_instagram"])
 
-        kw_contratos = ["contrato", "pdf", "documento formal", "acuerdo legal", "propuesta formal", "presupuesto pdf", "firmar", "firma"]
+        kw_contratos = ["contrato", "pdf", "documento formal", "acuerdo legal", "propuesta formal", "presupuesto pdf", "firmar", "firma", "estampar"]
         if any(p in t for p in kw_contratos):
             seleccion.add("generar_contrato_o_documento_formal")
 
@@ -1215,6 +1422,12 @@ REGLAS INNEGOCIABLES DE AUTORIDAD Y FORMATO:
             seleccion.add("enviar_correo_resend")
         if any(p in t for p in ["whatsapp", "mensaje a"]):
             seleccion.add("enviar_mensaje_whatsapp_oficial")
+
+        # Si el historial corto (últimos 3 mensajes) usó herramientas operativas, las mantenemos encendidas por si es una órden de seguimiento
+        if len(self.historial) >= 2 and not seleccion:
+            ult_msg = str(self.historial[-1].get("content", "")).lower()
+            if "proyecto" in ult_msg or "tarea" in ult_msg:
+                seleccion.update(["cambiar_estado_tarea", "registrar_o_actualizar_proyecto", "registrar_movimiento_financiero"])
 
         return [CATALOGO_TOOLS[nombre] for nombre in seleccion if nombre in CATALOGO_TOOLS]
 
@@ -1264,7 +1477,7 @@ REGLAS INNEGOCIABLES DE AUTORIDAD Y FORMATO:
             return {"exito": False, "error": "Falta MWAPI_KEY."}
         url_chat = f"{MWAPI_BASE_URL}/v1/chat/completions"
         headers = {"Authorization": f"Bearer {MWAPI_KEY}", "Content-Type": "application/json"}
-        mensajes_completos = [{"role": "system", "content": self.system_prompt}] + mensajes
+        mensajes_completos = [{"role": "system", "content": self.get_system_prompt_dinamico()}] + mensajes
         payload = {
             "model": MWAPI_MODEL,
             "max_tokens": 1500,
@@ -1308,7 +1521,7 @@ REGLAS INNEGOCIABLES DE AUTORIDAD Y FORMATO:
             mensajes_sesion = list(self.historial)
             mensajes_sesion.append({"role": "user", "content": instruccion})
 
-        etiqueta_modo = f"⚡ Jarvis + Supabase/Drive ({num_tools} tools)" if num_tools > 0 else "💬 Jarvis (Modo Ligero 0 tools)"
+        etiqueta_modo = f"⚡ Jarvis + Supabase ({num_tools} tools)" if num_tools > 0 else "💬 Jarvis (Modo Ligero 0 tools)"
         salidas_ejecutadas = []
 
         for _ in range(5):
@@ -1366,9 +1579,9 @@ def hilo_despertador_ejecutivo():
     logger.info("⏰ Vigilante iniciado.")
     while True:
         try:
-            ahora = datetime.datetime.now()
+            ahora = ahora_local()
             hora_actual = ahora.strftime("%H:%M")
-            fecha_hoy = str(ahora.date())
+            fecha_hoy = hoy_local_str()
             with db_lock:
                 conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
                 c = conn.cursor()
@@ -1388,7 +1601,7 @@ def hilo_despertador_ejecutivo():
                     conn.commit()
                     conn.close()
                 mensaje = (
-                    f"☀️ *REPORTE MATUTINO ({hora_actual})*\n"
+                    f"☀️ *REPORTE MATUTINO ({hora_actual} {TZ_NAME})*\n"
                     f"📅 *Fecha:* {fecha_hoy}\n\n"
                     f"{consultar_agenda_priorizada('pendiente')}\n\n"
                     f"{consultar_tablero_proyectos()}\n\n"
@@ -1415,13 +1628,12 @@ def enviar_respuesta_segura(chat_id: int, texto: str):
             bot.send_message(chat_id, trozo)
 
 def procesar_tarea_en_hilo(chat_id, texto_o_voz, es_audio=False, ruta_audio=None):
+    # 🟢 Reparación: Uso estricto de finally para evitar fugas de memoria y limpieza segura de audios
     try:
         if es_audio:
             texto = jarvis.transcribir_audio(ruta_audio)
             enviar_respuesta_segura(chat_id, f"🎙️ *Escuché:* \"_{texto}_\"")
             res = jarvis.procesar(texto)
-            if ruta_audio and os.path.exists(ruta_audio):
-                os.remove(ruta_audio)
         else:
             texto = texto_o_voz
             res = jarvis.procesar(texto)
@@ -1431,27 +1643,42 @@ def procesar_tarea_en_hilo(chat_id, texto_o_voz, es_audio=False, ruta_audio=None
         if usuario_pidio_voz(texto):
             ruta_tts = generar_audio_voz_jarvis(res)
             if ruta_tts and os.path.exists(ruta_tts):
-                with open(ruta_tts, "rb") as audio_f:
-                    bot.send_voice(chat_id, audio_f)
-                os.remove(ruta_tts)
+                try:
+                    with open(ruta_tts, "rb") as audio_f:
+                        bot.send_voice(chat_id, audio_f)
+                finally:
+                    if os.path.exists(ruta_tts):
+                        os.remove(ruta_tts)
     except Exception as e:
         bot.send_message(chat_id, f"❌ Error: {str(e)}")
+    finally:
+        if es_audio and ruta_audio and os.path.exists(ruta_audio):
+            try:
+                os.remove(ruta_audio)
+            except Exception:
+                pass
 
 def procesar_video_en_hilo(chat_id, ruta_vid, caption):
+    # 🟢 Reparación: Limpieza segura de videos en bloque finally
     try:
         enviar_respuesta_segura(chat_id, "📥 *Analizando video en segundo plano...*")
         res = jarvis.procesar_video_multimodal(ruta_vid, caption)
         enviar_respuesta_segura(chat_id, res)
-        if ruta_vid and os.path.exists(ruta_vid):
-            os.remove(ruta_vid)
     except Exception as e:
         bot.send_message(chat_id, f"❌ Error video: {str(e)}")
+    finally:
+        if ruta_vid and os.path.exists(ruta_vid):
+            try:
+                os.remove(ruta_vid)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
     print("=======================================================================")
     print(f"🚀 INICIANDO JARVIS CFO & JEFE DE GABINETE ({MWAPI_MODEL})")
-    print(f"☁️ SUPABASE CONECTADO: {'SÍ ✅' if supabase_activo() else 'MODO LOCAL ⚠️'}")
+    print(f"☁️ SUPABASE REST API: {'CONECTADA 🟢' if supabase_rest_activo() else 'MODO LOCAL 🔴'}")
+    print(f"🕒 ZONA HORARIA ACTIVA: {TZ_NAME}")
     print("=======================================================================")
     autenticar_google()
     jarvis = CerebroJarvis()
@@ -1502,6 +1729,6 @@ if __name__ == "__main__":
                 f.write(bot.download_file(f_info.file_path))
             threading.Thread(target=procesar_video_en_hilo, args=(m.chat.id, ruta_vid, m.caption or ""), daemon=True).start()
 
-    print("🤖 ¡JARVIS OPERATIVO CON MWAPI CLAUDE HAIKU 4.5, SUPABASE, DRIVE, VOZ Y PDF!\n")
+    print("🤖 ¡JARVIS OPERATIVO Y A LA ESPERA DE ÓRDENES!\n")
     if bot:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
