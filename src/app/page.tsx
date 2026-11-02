@@ -124,18 +124,33 @@ export default function JarvisCyberpunkHUD() {
   }, []);
 
   // Sintetizador de voz nativo en navegador para cuando Jarvis responde en el HUD
+  // Reproductor neuronal Edge-TTS (Jorge Neural) para el HUD con animacion del orbe
   const speakJarvisBrowser = (text: string) => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    if (typeof window === "undefined") return;
+    const clean = text.replace(/[*_#`~>•]/g, "").trim();
+    if (!clean) return;
+
     try {
-      window.speechSynthesis.cancel();
-      const clean = text.replace(/[*_#`~>•]/g, "");
-      const utter = new SpeechSynthesisUtterance(clean);
-      utter.lang = "es-MX";
-      utter.rate = 1.06;
-      utter.pitch = 0.88;
-      utter.onstart = () => setOrbStatus("speaking");
-      utter.onend = () => setOrbStatus("idle");
-      window.speechSynthesis.speak(utter);
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      setOrbStatus("speaking");
+
+      const audio = new Audio(`/api/tts?text=${encodeURIComponent(clean.slice(0, 700))}`);
+      audio.onended = () => setOrbStatus("idle");
+      audio.onerror = () => {
+        if ("speechSynthesis" in window) {
+          const utter = new SpeechSynthesisUtterance(clean);
+          utter.lang = "es-MX";
+          utter.rate = 1.0;
+          utter.pitch = 1.0;
+          utter.onend = () => setOrbStatus("idle");
+          window.speechSynthesis.speak(utter);
+        } else {
+          setOrbStatus("idle");
+        }
+      };
+      audio.play().catch(() => {
+        setOrbStatus("idle");
+      });
     } catch {
       setOrbStatus("idle");
     }
