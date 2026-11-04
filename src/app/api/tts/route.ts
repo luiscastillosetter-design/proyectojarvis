@@ -35,6 +35,6 @@ export async function GET(req: NextRequest) {
     });
   } catch (error: any) {
     console.error("Error en /api/tts:", error);
-    return new NextResponse("Error generando voz con Edge-TTS", { status: 500 });
+    return new NextResponse("Error en síntesis", { status: 500 });
   }
 }
