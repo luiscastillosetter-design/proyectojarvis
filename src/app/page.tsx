@@ -134,7 +134,7 @@ export default function JarvisCyberpunkHUD() {
       if ("speechSynthesis" in window) window.speechSynthesis.cancel();
       setOrbStatus("speaking");
 
-      const audio = new Audio(`/api/tts?text=${encodeURIComponent(clean.slice(0, 700))}`);
+      const audio = new Audio(`https://tts.cybernex.workers.dev/?voice=es-MX-JorgeNeural&text=${encodeURIComponent(clean.slice(0, 700))}`);
       audio.onended = () => setOrbStatus("idle");
       audio.onerror = () => {
         if ("speechSynthesis" in window) {
