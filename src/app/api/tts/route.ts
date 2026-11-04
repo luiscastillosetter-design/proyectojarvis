@@ -10,9 +10,7 @@ export async function GET(req: NextRequest) {
     const text = searchParams.get("text") || "";
     const clean = text.replace(/[*_#`~>•]/g, "").trim().slice(0, 1000);
 
-    if (!clean) {
-      return new NextResponse("Texto vacío", { status: 400 });
-    }
+    if (!clean) return new NextResponse("Texto vacío", { status: 400 });
 
     const tts = new MsEdgeTTS();
     await tts.setMetadata("es-MX-JorgeNeural", OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
@@ -25,8 +23,7 @@ export async function GET(req: NextRequest) {
       readable.on("error", (err) => reject(err));
     });
 
-    const buffer = Buffer.concat(chunks);
-    return new NextResponse(buffer, {
+    return new NextResponse(Buffer.concat(chunks), {
       status: 200,
       headers: {
         "Content-Type": "audio/mpeg",
@@ -34,7 +31,6 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (error: any) {
-    console.error("Error en /api/tts:", error);
     return new NextResponse("Error en síntesis", { status: 500 });
   }
 }

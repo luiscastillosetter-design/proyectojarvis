@@ -33,3 +33,9 @@ venv-xtts/
 xtts_models/
 
 proyectos_agencia/
+
+*.zip
+*.db
+*.log
+temp_audios/
+

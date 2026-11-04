@@ -196,6 +196,15 @@ def inicializar_respaldo_local():
             tipo TEXT, monto REAL, moneda TEXT DEFAULT 'USD',
             concepto TEXT, cliente_o_proyecto TEXT, metodo_pago TEXT, fecha TEXT
         )""")
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS jarvis_alarmas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recordatorio TEXT NOT NULL,
+            fecha_hora TEXT NOT NULL,
+            notificado INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+
         c.execute("""CREATE TABLE IF NOT EXISTS jarvis_memoria (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             categoria TEXT, cliente_o_tema TEXT, detalle_completo TEXT, fecha TEXT
@@ -1575,13 +1584,36 @@ CONTRATOS Y DOCUMENTOS: Cuando el jefe te pida redactar, hacer o generar un cont
 # =====================================================================
 # 7. DESPERTADOR MATUTINO CON RESUMEN DE AGENDA, PROYECTOS Y FINANZAS
 # =====================================================================
+
+def agendar_alarma_o_recordatorio(recordatorio: str, fecha_hora_str: str) -> str:
+    """Agenda una alarma o recordatorio. Formato fecha_hora_str: 'YYYY-MM-DD HH:MM' o 'HH:MM'."""
+    try:
+        ahora = ahora_local()
+        fh = fecha_hora_str.strip()
+        if len(fh) == 5 and ":" in fh:
+            fh = f"{ahora.strftime('%Y-%m-%d')} {fh}"
+        with db_lock:
+            conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
+            c = conn.cursor()
+            c.execute("CREATE TABLE IF NOT EXISTS jarvis_alarmas (id INTEGER PRIMARY KEY AUTOINCREMENT, recordatorio TEXT, fecha_hora TEXT, notificado INTEGER DEFAULT 0)")
+            c.execute("INSERT INTO jarvis_alarmas (recordatorio, fecha_hora, notificado) VALUES (?, ?, 0)", (recordatorio, fh))
+            conn.commit()
+            conn.close()
+        return f"⏰ Alarma configurada para las {fh}: {recordatorio}"
+    except Exception as e:
+        return f"Error al agendar alarma: {e}"
+
+
 def hilo_despertador_ejecutivo():
-    logger.info("⏰ Vigilante iniciado.")
+    logger.info("⏰ Vigilante iniciado con alarmas dinámicas activas.")
     while True:
         try:
             ahora = ahora_local()
             hora_actual = ahora.strftime("%H:%M")
             fecha_hoy = hoy_local_str()
+            fh_comparar = ahora.strftime("%Y-%m-%d %H:%M")
+
+            # Chequeo matutino (7:00 AM)
             with db_lock:
                 conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
                 c = conn.cursor()
@@ -1591,8 +1623,27 @@ def hilo_despertador_ejecutivo():
                 c.execute("SELECT valor FROM configuracion WHERE clave = 'ultimo_briefing_fecha'")
                 r_fec = c.fetchone()
                 ult_fecha = r_fec[0] if r_fec else ""
+
+                # Buscar alarmas pendientes para este minuto
+                c.execute("CREATE TABLE IF NOT EXISTS jarvis_alarmas (id INTEGER PRIMARY KEY AUTOINCREMENT, recordatorio TEXT, fecha_hora TEXT, notificado INTEGER DEFAULT 0)")
+                c.execute("SELECT id, recordatorio FROM jarvis_alarmas WHERE notificado = 0 AND fecha_hora <= ?", (fh_comparar,))
+                alarmas_activas = c.fetchall()
+                for aid, _ in alarmas_activas:
+                    c.execute("UPDATE jarvis_alarmas SET notificado = 1 WHERE id = ?", (aid,))
+                conn.commit()
                 conn.close()
 
+            # Disparar alertas inmediatas
+            target_id = ID_TELEGRAM_LUIS
+            if bot and target_id:
+                for aid, rec in alarmas_activas:
+                    alerta_txt = f"🔔 *RECORDATORIO DE JARVIS*
+
+📌 {rec}
+🕒 Hora: {hora_actual}"
+                    bot.send_message(target_id, alerta_txt, parse_mode="Markdown")
+
+            # Disparar informe matutino
             if hora_actual == hora_obj and ult_fecha != fecha_hoy:
                 with db_lock:
                     conn = sqlite3.connect(ARCHIVO_DB_LOCAL)
@@ -1601,19 +1652,29 @@ def hilo_despertador_ejecutivo():
                     conn.commit()
                     conn.close()
                 mensaje = (
-                    f"☀️ *REPORTE MATUTINO ({hora_actual} {TZ_NAME})*\n"
-                    f"📅 *Fecha:* {fecha_hoy}\n\n"
-                    f"{consultar_agenda_priorizada('pendiente')}\n\n"
-                    f"{consultar_tablero_proyectos()}\n\n"
-                    f"{consultar_reporte_financiero()}\n\n"
+                    f"☀️ *REPORTE MATUTINO ({hora_actual} {TZ_NAME})*
+"
+                    f"📅 *Fecha:* {fecha_hoy}
+
+"
+                    f"{consultar_agenda_priorizada('pendiente')}
+
+"
+                    f"{consultar_tablero_proyectos()}
+
+"
+                    f"{consultar_reporte_financiero()}
+
+"
                     f"💡 _Mándame un audio si cobraste algo o completaste una tarea._"
                 )
-                if bot and ID_TELEGRAM_LUIS:
+                if bot and target_id:
                     for i in range(0, len(mensaje), 4000):
-                        bot.send_message(ID_TELEGRAM_LUIS, mensaje[i:i+4000], parse_mode="Markdown")
+                        bot.send_message(target_id, mensaje[i:i+4000], parse_mode="Markdown")
+
         except Exception as e:
             logger.error(f"Error despertador: {e}")
-        time.sleep(30)
+        time.sleep(20)
 
 
 # =====================================================================
