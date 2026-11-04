@@ -14,13 +14,14 @@ export async function GET(req: NextRequest) {
 
     const tts = new MsEdgeTTS();
     await tts.setMetadata("es-MX-JorgeNeural", OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-    const readable = tts.toStream(clean);
+    const result = await tts.toStream(clean);
+    const stream = (result as any).audioStream || result;
 
     const chunks: Buffer[] = [];
     await new Promise<void>((resolve, reject) => {
-      readable.on("data", (chunk: Buffer) => chunks.push(chunk));
-      readable.on("end", () => resolve());
-      readable.on("error", (err) => reject(err));
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      stream.on("end", () => resolve());
+      stream.on("error", (err: any) => reject(err));
     });
 
     return new NextResponse(Buffer.concat(chunks), {
